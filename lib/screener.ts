@@ -155,7 +155,7 @@ export async function screenTicker(ticker: string): Promise<ScreenResult> {
       result.longStrike = parseFloat((shortPut.strike - 5).toFixed(2));
       result.spreadWidth = 5;
       result.oi = shortPut.openInterest ?? 0;
-      result.oiPass = result.oi >= 500;
+      result.oiPass = (result.oi ?? 0) >= 500;
 
       const bid = shortPut.bid ?? 0;
       const ask = shortPut.ask ?? 0;
