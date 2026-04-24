@@ -90,7 +90,7 @@ async function screenTicker(ticker: string): Promise<ScreenResult> {
     }
 
     // Get the best expiration
-    const expirations = [...new Set(puts.map((p: any) => p.expirationDate as string))].sort();
+    const expirations = Array.from(new Set(puts.map((p: any) => p.expirationDate as string))).sort();
     const bestExp = expirations[0];
     r.expiration = bestExp;
     r.dte = getDTE(bestExp);
