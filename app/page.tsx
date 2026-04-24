@@ -27,16 +27,13 @@ interface ScreenResult {
   failReasons: string[];
 }
 
-function getDTE(ts: number) {
-  return Math.round((ts * 1000 - Date.now()) / 86400000);
-}
-function fmtDate(ts: number) {
-  return new Date(ts * 1000).toISOString().split('T')[0];
+function getDTE(dateStr: string) {
+  return Math.round((new Date(dateStr).getTime() - Date.now()) / 86400000);
 }
 
-async function yf(path: string) {
-  const res = await fetch(`/api/screen?path=${encodeURIComponent(path)}`);
-  if (!res.ok) throw new Error(`Yahoo error ${res.status}`);
+async function api(ticker: string, type: string) {
+  const res = await fetch(`/api/screen?ticker=${ticker}&type=${type}`);
+  if (!res.ok) throw new Error(`API error ${res.status}`);
   return res.json();
 }
 
@@ -52,52 +49,76 @@ async function screenTicker(ticker: string): Promise<ScreenResult> {
   };
 
   try {
-    const q = await yf(`/v10/finance/quoteSummary/${ticker}?modules=price,calendarEvents`);
-    const s = q?.quoteSummary?.result?.[0];
-    if (!s) throw new Error('No Yahoo data');
-    r.price = s.price?.regularMarketPrice?.raw ?? 0;
+    // Get quote
+    const quoteData = await api(ticker, 'quote');
+    const quote = Array.isArray(quoteData) ? quoteData[0] : quoteData;
+    if (!quote) throw new Error('No quote data');
+    r.price = quote.price ?? 0;
 
-    const ed = s.calendarEvents?.earnings?.earningsDate;
-    if (ed?.length) r.earningsDate = fmtDate(ed[0].raw);
-
-    const low = s.price?.fiftyTwoWeekLow?.raw ?? 0;
-    const high = s.price?.fiftyTwoWeekHigh?.raw ?? 0;
+    // 52-week position for strategy
+    const low = quote.yearLow ?? 0;
+    const high = quote.yearHigh ?? 0;
     const pos = (high - low) > 0 ? (r.price - low) / (high - low) : 0.5;
     r.strategy = pos > 0.6 ? 'BPS' : pos < 0.4 ? 'BCS' : 'IC';
 
-    const o1 = await yf(`/v7/finance/options/${ticker}`);
-    const exps: number[] = o1?.optionChain?.result?.[0]?.expirationDates ?? [];
-    const bestExp = exps.find(ts => { const d = getDTE(ts); return d >= 27 && d <= 45; });
+    // Get earnings
+    const earningsData = await api(ticker, 'earnings');
+    if (Array.isArray(earningsData) && earningsData.length > 0) {
+      const upcoming = earningsData.find((e: any) => new Date(e.date) > new Date());
+      if (upcoming) r.earningsDate = upcoming.date;
+    }
 
-    if (!bestExp) {
-      r.failReasons.push('No expiration in 27-45 DTE window');
+    // Get options chain
+    const chainData = await api(ticker, 'chain');
+    const contracts = Array.isArray(chainData) ? chainData : (chainData?.optionChain ?? []);
+
+    if (!contracts.length) {
+      r.failReasons.push('No options chain data available');
       return r;
     }
 
-    r.expiration = fmtDate(bestExp);
+    // Find puts in 27-45 DTE window
+    const puts = contracts.filter((c: any) => 
+      c.putCall === 'PUT' && 
+      getDTE(c.expirationDate) >= 27 && 
+      getDTE(c.expirationDate) <= 45
+    );
+
+    if (!puts.length) {
+      r.failReasons.push('No puts in 27-45 DTE window');
+      return r;
+    }
+
+    // Get the best expiration
+    const expirations = [...new Set(puts.map((p: any) => p.expirationDate as string))].sort();
+    const bestExp = expirations[0];
+    r.expiration = bestExp;
     r.dte = getDTE(bestExp);
 
-    if (r.earningsDate && r.earningsDate <= r.expiration) {
+    // Check earnings within window
+    if (r.earningsDate && r.expiration && r.earningsDate <= r.expiration) {
       r.earningsPass = false;
       r.failReasons.push(`Earnings within window (${r.earningsDate})`);
     }
 
-    const o2 = await yf(`/v7/finance/options/${ticker}?date=${bestExp}`);
-    const puts = o2?.optionChain?.result?.[0]?.options?.[0]?.puts ?? [];
+    // Get puts for best expiration
+    const expPuts = puts.filter((p: any) => p.expirationDate === bestExp);
 
-    const atm = puts
+    // Estimate IV from ATM put
+    const atmPut = expPuts
       .filter((p: any) => Math.abs(p.strike - r.price) / r.price < 0.05)
       .sort((a: any, b: any) => Math.abs(a.strike - r.price) - Math.abs(b.strike - r.price))[0];
 
-    if (atm?.impliedVolatility) {
-      r.ivEstimate = Math.round(atm.impliedVolatility * 100);
+    if (atmPut?.impliedVolatility != null) {
+      r.ivEstimate = Math.round(atmPut.impliedVolatility * 100);
       r.ivrPass = r.ivEstimate >= 30;
       r.ivrNote = `IV ~${r.ivEstimate}% — verify IVR in TastyTrade`;
       if (!r.ivrPass) r.failReasons.push(`IV too low (~${r.ivEstimate}%)`);
     }
 
+    // Find short put target ~10-12% OTM
     const target = r.price * 0.88;
-    const sp = puts
+    const sp = expPuts
       .filter((p: any) => p.strike <= r.price * 0.93 && p.strike >= r.price * 0.78)
       .sort((a: any, b: any) => Math.abs(a.strike - target) - Math.abs(b.strike - target))[0];
 
@@ -110,13 +131,18 @@ async function screenTicker(ticker: string): Promise<ScreenResult> {
       const bid = sp.bid ?? 0, ask = sp.ask ?? 0;
       r.bidAsk = parseFloat((ask - bid).toFixed(2));
       r.bidAskPass = r.bidAsk <= 0.10;
-      const mn = sp.strike / r.price;
-      r.delta = parseFloat((mn > 0.95 ? -0.30 : mn > 0.90 ? -0.20 : mn > 0.85 ? -0.12 : -0.08).toFixed(2));
+      r.delta = sp.delta != null ? parseFloat(sp.delta.toFixed(2)) : null;
+      if (r.delta === null) {
+        const mn = sp.strike / r.price;
+        r.delta = parseFloat((mn > 0.95 ? -0.30 : mn > 0.90 ? -0.20 : mn > 0.85 ? -0.12 : -0.08).toFixed(2));
+      }
       r.deltaPass = Math.abs(r.delta) >= 0.15 && Math.abs(r.delta) <= 0.22;
-      const lp = puts.filter((p: any) => p.strike < sp.strike)
+      const lp = expPuts
+        .filter((p: any) => p.strike < sp.strike)
         .sort((a: any, b: any) => Math.abs(a.strike - r.longStrike!) - Math.abs(b.strike - r.longStrike!))[0];
       r.credit = parseFloat(Math.max(0, bid - (lp?.bid ?? 0)).toFixed(2));
       r.creditPass = r.credit >= r.spreadWidth / 3;
+
       if (!r.oiPass) r.failReasons.push(`OI ${r.oi} < 500`);
       if (!r.bidAskPass) r.failReasons.push(`Bid-ask $${r.bidAsk} > $0.10`);
       if (!r.deltaPass) r.failReasons.push(`Delta ~${r.delta} outside 0.15-0.22`);
@@ -128,6 +154,7 @@ async function screenTicker(ticker: string): Promise<ScreenResult> {
     const nonIvr = r.failReasons.filter(x => !x.includes('IV'));
     r.verdict = nonIvr.length === 0 && r.failReasons.length === 0 ? 'PASS'
       : nonIvr.length === 0 ? 'CHECK IVR' : 'FAIL';
+
   } catch (e: any) {
     r.failReasons.push(`Error: ${e.message}`);
   }
@@ -157,7 +184,7 @@ export default function Home() {
       const tickers = input.split(/[\s,]+/).filter(Boolean);
       const out: ScreenResult[] = [];
       for (const t of tickers) {
-        setProgress(`Screening ${t}...`);
+        setProgress(`Screening ${t.toUpperCase()}...`);
         const r = await screenTicker(t.trim().toUpperCase());
         out.push(r);
         setResults([...out]);
@@ -219,7 +246,7 @@ export default function Home() {
       <div className="wrap">
         <div style={{borderBottom:'1px solid #1e293b',paddingBottom:'1.25rem',marginBottom:'1.5rem'}}>
           <h1>OPTIONS SCREENER</h1>
-          <div className="sub">Yahoo Finance · BPS / BCS / IC · IVR Must Be Verified in TastyTrade</div>
+          <div className="sub">FMP Data · BPS / BCS / IC · IVR Must Be Verified in TastyTrade</div>
           <div className="rules">
             {['IVR ≥ 30 (verify TT)','OI ≥ 500','Delta 0.15–0.22','Credit ≥ ⅓ width','Bid-ask ≤ $0.10','DTE 27–45','No earnings in window'].map(r=><span key={r} className="rule">{r}</span>)}
           </div>
@@ -237,9 +264,9 @@ export default function Home() {
 
         {results.length > 0 && <>
           <div className="sum">
-            <div className="sc"><div className={`sn np`}>{passes.length}</div><div className="sl">PASS</div></div>
-            <div className="sc"><div className={`sn nc`}>{checks.length}</div><div className="sl">CHECK IVR</div></div>
-            <div className="sc"><div className={`sn nf`}>{fails.length}</div><div className="sl">FAIL</div></div>
+            <div className="sc"><div className="sn np">{passes.length}</div><div className="sl">PASS</div></div>
+            <div className="sc"><div className="sn nc">{checks.length}</div><div className="sl">CHECK IVR</div></div>
+            <div className="sc"><div className="sn nf">{fails.length}</div><div className="sl">FAIL</div></div>
           </div>
           {[...passes,...checks,...fails].map(r=>(
             <div key={r.ticker} className="card">
@@ -258,16 +285,15 @@ export default function Home() {
               </div>
               {r.ivrNote&&<div className="ivn">⚠ {r.ivrNote}</div>}
               {r.shortStrike&&<div className="td">
-                {[
-                  ['STRATEGY',r.strategy],['EXPIRY',r.expiration],['DTE',r.dte],
+                {([['STRATEGY',r.strategy],['EXPIRY',r.expiration],['DTE',r.dte],
                   ['SHORT/LONG',`${r.shortStrike}/${r.longStrike}`],
                   ['CREDIT',r.credit!=null?`$${r.credit.toFixed(2)}`:'—'],
                   ['WIDTH',r.spreadWidth?`$${r.spreadWidth}`:'—'],
                   ['DELTA',r.delta?.toFixed(2)],
                   ['OI',r.oi?.toLocaleString()],
                   ['BID-ASK',r.bidAsk!=null?`$${r.bidAsk.toFixed(2)}`:'—'],
-                ].map(([label,val])=>(
-                  <div key={label as string} className="d">
+                ] as [string,any][]).map(([label,val])=>(
+                  <div key={label} className="d">
                     <div className="dl">{label}</div>
                     <div className="dv">{val??'—'}</div>
                   </div>

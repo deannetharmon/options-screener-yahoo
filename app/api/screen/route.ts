@@ -1,21 +1,30 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+const FMP = 'https://financialmodelingprep.com/api/v3';
+const KEY = process.env.FMP_API_KEY;
+
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const path = searchParams.get('path');
-  if (!path) return NextResponse.json({ error: 'path required' }, { status: 400 });
+  const ticker = searchParams.get('ticker');
+  const type = searchParams.get('type');
 
-  const url = `https://query2.finance.yahoo.com${path}`;
+  if (!ticker) return NextResponse.json({ error: 'ticker required' }, { status: 400 });
+  if (!KEY) return NextResponse.json({ error: 'FMP_API_KEY not configured' }, { status: 500 });
+
   try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Referer': 'https://finance.yahoo.com/',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-    });
-    if (!res.ok) return NextResponse.json({ error: `Yahoo ${res.status}` }, { status: res.status });
+    let url = '';
+    if (type === 'quote') {
+      url = `${FMP}/quote/${ticker}?apikey=${KEY}`;
+    } else if (type === 'options') {
+      url = `${FMP}/historical-price-full/stock_dividend/${ticker}?apikey=${KEY}`;
+    } else if (type === 'chain') {
+      url = `https://financialmodelingprep.com/api/v4/options/chain?symbol=${ticker}&apikey=${KEY}`;
+    } else if (type === 'earnings') {
+      url = `${FMP}/earning_calendar?symbol=${ticker}&apikey=${KEY}`;
+    }
+
+    const res = await fetch(url);
+    if (!res.ok) return NextResponse.json({ error: `FMP error ${res.status}` }, { status: res.status });
     const data = await res.json();
     return NextResponse.json(data);
   } catch (e: any) {
