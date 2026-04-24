@@ -200,7 +200,7 @@ export default function Home() {
                   <div className="ivr-note">⚠ {r.ivrNote}</div>
                 )}
 
-               {r.shortStrike && (
+                {r.chainChecked && (
                   <div className="trade-details">
                     <div className="detail">
                       <div className="detail-label">STRATEGY</div>
