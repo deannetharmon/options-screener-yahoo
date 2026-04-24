@@ -58,10 +58,10 @@ export default function Home() {
     try {
       const tickers = tickerInput.split(/[\s,]+/).filter(Boolean);
       const res = await fetch('/api/screen', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tickers }),
-      });
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tickers }),
+    });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Screen failed');
       setResults(data.results);
