@@ -78,7 +78,7 @@ export async function screenTicker(ticker: string): Promise<ScreenResult> {
   };
 
   try {
-    const quoteUrl = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${ticker}?modules=price,calendarEvents`;
+    const quoteUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${ticker}?modules=price,calendarEvents`;
     const quoteData = await yahooFetch(quoteUrl);
     const summary = quoteData?.quoteSummary?.result?.[0];
     if (!summary) throw new Error('No data returned from Yahoo Finance');
