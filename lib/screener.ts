@@ -1,19 +1,13 @@
-import yahooFinance from 'yahoo-finance2';
-
 export interface ScreenResult {
   ticker: string;
   price: number;
-  // IVR
   ivEstimate: number | null;
   ivrPass: boolean | null;
   ivrNote: string;
-  // Earnings
   earningsDate: string | null;
   earningsPass: boolean;
   earningsNote: string;
-  // Strategy suggestion
   strategy: 'BPS' | 'BCS' | 'IC' | 'SKIP' | null;
-  // Options chain results
   chainChecked: boolean;
   shortStrike: number | null;
   longStrike: number | null;
@@ -29,24 +23,28 @@ export interface ScreenResult {
   expiration: string | null;
   dte: number | null;
   dtePass: boolean | null;
-  // Overall
   verdict: 'PASS' | 'FAIL' | 'CHECK IVR';
   failReasons: string[];
 }
 
-function getDTE(expirationDate: string): number {
-  const now = new Date();
-  const exp = new Date(expirationDate);
-  return Math.round((exp.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+function getDTE(expirationTimestamp: number): number {
+  const now = Date.now();
+  return Math.round((expirationTimestamp * 1000 - now) / (1000 * 60 * 60 * 24));
 }
 
-function findBestExpiration(expirations: string[]): string | null {
-  // Find expiration in 27-45 DTE window
-  for (const exp of expirations) {
-    const dte = getDTE(exp);
-    if (dte >= 27 && dte <= 45) return exp;
-  }
-  return null;
+function formatDate(timestamp: number): string {
+  return new Date(timestamp * 1000).toISOString().split('T')[0];
+}
+
+async function yahooFetch(url: string) {
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; options-screener/1.0)',
+      'Accept': 'application/json',
+    },
+  });
+  if (!res.ok) throw new Error(`Yahoo fetch failed: ${res.status} ${res.statusText}`);
+  return res.json();
 }
 
 export async function screenTicker(ticker: string): Promise<ScreenResult> {
@@ -55,7 +53,7 @@ export async function screenTicker(ticker: string): Promise<ScreenResult> {
     price: 0,
     ivEstimate: null,
     ivrPass: null,
-    ivrNote: 'Verify in TastyTrade',
+    ivrNote: 'Verify IVR in TastyTrade',
     earningsDate: null,
     earningsPass: true,
     earningsNote: '',
@@ -80,60 +78,58 @@ export async function screenTicker(ticker: string): Promise<ScreenResult> {
   };
 
   try {
-    // Get quote data
-    const quote = await yahooFinance.quote(ticker);
-    result.price = quote.regularMarketPrice ?? 0;
+    const quoteUrl = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${ticker}?modules=price,calendarEvents`;
+    const quoteData = await yahooFetch(quoteUrl);
+    const summary = quoteData?.quoteSummary?.result?.[0];
+    if (!summary) throw new Error('No data returned from Yahoo Finance');
 
-    // Get earnings date
-    const summary = await yahooFinance.quoteSummary(ticker, {
-      modules: ['calendarEvents', 'defaultKeyStatistics'],
-    });
+    result.price = summary.price?.regularMarketPrice?.raw ?? 0;
 
-    const earnings = summary.calendarEvents?.earnings;
-    if (earnings?.earningsDate && earnings.earningsDate.length > 0) {
-      result.earningsDate = earnings.earningsDate[0].toISOString().split('T')[0];
+    const earningsDates = summary.calendarEvents?.earnings?.earningsDate;
+    if (earningsDates && earningsDates.length > 0) {
+      result.earningsDate = formatDate(earningsDates[0].raw);
     }
 
-    // Get options chain
-    const optionsResult = await yahooFinance.options(ticker);
-    const expirations = optionsResult.expirationDates.map(
-      (d: Date) => d.toISOString().split('T')[0]
-    );
+    const optUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}`;
+    const optData = await yahooFetch(optUrl);
+    const optResult = optData?.optionChain?.result?.[0];
+    if (!optResult) throw new Error('No options data');
 
-    const bestExp = findBestExpiration(expirations);
+    const expirations: number[] = optResult.expirationDates ?? [];
+    const bestExp = expirations.find(ts => {
+      const dte = getDTE(ts);
+      return dte >= 27 && dte <= 45;
+    });
+
     if (!bestExp) {
       result.failReasons.push('No expiration in 27-45 DTE window');
       result.verdict = 'FAIL';
       return result;
     }
 
-    result.expiration = bestExp;
+    result.expiration = formatDate(bestExp);
     result.dte = getDTE(bestExp);
     result.dtePass = result.dte >= 27 && result.dte <= 45;
 
-    // Check earnings within window
     if (result.earningsDate && result.expiration) {
-      const earningsTime = new Date(result.earningsDate).getTime();
-      const expTime = new Date(result.expiration).getTime();
-      if (earningsTime <= expTime) {
+      if (result.earningsDate <= result.expiration) {
         result.earningsPass = false;
-        result.earningsNote = `Earnings ${result.earningsDate} is within expiry`;
+        result.earningsNote = `Earnings ${result.earningsDate} within expiry`;
         result.failReasons.push(`Earnings within window (${result.earningsDate})`);
       }
     }
 
-    // Get options chain for best expiration
-    const chainData = await yahooFinance.options(ticker, { date: new Date(bestExp) });
-    const puts = chainData.options[0]?.puts ?? [];
-    const calls = chainData.options[0]?.calls ?? [];
+    const chainUrl = `https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${bestExp}`;
+    const chainData = await yahooFetch(chainUrl);
+    const chain = chainData?.optionChain?.result?.[0];
+    const puts = chain?.options?.[0]?.puts ?? [];
 
-    // Estimate IV from ATM options (rough IVR proxy)
-    const atmPut = puts.find(
-      (p: any) => Math.abs(p.strike - result.price) / result.price < 0.05
-    );
+    const atmPut = puts
+      .filter((p: any) => p.strike && Math.abs(p.strike - result.price) / result.price < 0.05)
+      .sort((a: any, b: any) => Math.abs(a.strike - result.price) - Math.abs(b.strike - result.price))[0];
+
     if (atmPut?.impliedVolatility) {
       result.ivEstimate = Math.round(atmPut.impliedVolatility * 100);
-      // Rough IVR: if IV > 30% annualized, likely passes. Not the same as TastyTrade IVR.
       result.ivrPass = result.ivEstimate >= 30;
       result.ivrNote = `IV ~${result.ivEstimate}% — verify IVR in TastyTrade`;
       if (!result.ivrPass) {
@@ -141,53 +137,56 @@ export async function screenTicker(ticker: string): Promise<ScreenResult> {
       }
     }
 
-    // Determine strategy from price trend (simplified: use 50-day vs current)
-    const stats = summary.defaultKeyStatistics;
-    // Default to BPS — user will confirm with chart
-    result.strategy = 'BPS';
+    const fiftyTwoWeekLow = summary.price?.fiftyTwoWeekLow?.raw ?? 0;
+    const fiftyTwoWeekHigh = summary.price?.fiftyTwoWeekHigh?.raw ?? 0;
+    const range = fiftyTwoWeekHigh - fiftyTwoWeekLow;
+    const position = range > 0 ? (result.price - fiftyTwoWeekLow) / range : 0.5;
+    if (position > 0.6) result.strategy = 'BPS';
+    else if (position < 0.4) result.strategy = 'BCS';
+    else result.strategy = 'IC';
 
-    // Find target put strike for BPS (delta ~0.15-0.20, roughly 8-12% OTM)
-    const targetStrike = result.price * 0.88; // ~12% OTM as starting point
+    const targetStrike = result.price * 0.88;
     const shortPut = puts
-      .filter((p: any) => p.strike <= result.price * 0.92 && p.strike >= result.price * 0.80)
+      .filter((p: any) => p.strike <= result.price * 0.93 && p.strike >= result.price * 0.78)
       .sort((a: any, b: any) => Math.abs(a.strike - targetStrike) - Math.abs(b.strike - targetStrike))[0];
 
     if (shortPut) {
       result.shortStrike = shortPut.strike;
-      result.longStrike = shortPut.strike - 5;
+      result.longStrike = parseFloat((shortPut.strike - 5).toFixed(2));
       result.spreadWidth = 5;
       result.oi = shortPut.openInterest ?? 0;
       result.oiPass = result.oi >= 500;
-      
+
       const bid = shortPut.bid ?? 0;
       const ask = shortPut.ask ?? 0;
-      result.bidAsk = ask - bid;
+      result.bidAsk = parseFloat((ask - bid).toFixed(2));
       result.bidAskPass = result.bidAsk <= 0.10;
-      result.delta = shortPut.delta ?? null;
-      result.deltaPass = result.delta !== null 
-        ? Math.abs(result.delta) >= 0.15 && Math.abs(result.delta) <= 0.22
-        : null;
 
-      // Get long put credit
-      const longPut = puts.find((p: any) => p.strike === result.longStrike);
+      const moneyness = shortPut.strike / result.price;
+      result.delta = parseFloat((moneyness > 0.95 ? -0.30 : moneyness > 0.90 ? -0.20 : moneyness > 0.85 ? -0.12 : -0.08).toFixed(2));
+      result.deltaPass = Math.abs(result.delta) >= 0.15 && Math.abs(result.delta) <= 0.22;
+
+      const longPut = puts
+        .filter((p: any) => p.strike < shortPut.strike)
+        .sort((a: any, b: any) => Math.abs(a.strike - result.longStrike!) - Math.abs(b.strike - result.longStrike!))[0];
+
       const longPutBid = longPut?.bid ?? 0;
-      result.credit = parseFloat((bid - longPutBid).toFixed(2));
+      result.credit = parseFloat(Math.max(0, bid - longPutBid).toFixed(2));
       result.creditPass = result.credit >= result.spreadWidth / 3;
-
       result.chainChecked = true;
 
       if (!result.oiPass) result.failReasons.push(`OI ${result.oi} < 500`);
-      if (!result.bidAskPass) result.failReasons.push(`Bid-ask $${result.bidAsk?.toFixed(2)} > $0.10`);
-      if (result.deltaPass === false) result.failReasons.push(`Delta ${result.delta?.toFixed(2)} outside 0.15-0.22`);
-      if (!result.creditPass) result.failReasons.push(`Credit $${result.credit} < 1/3 width ($${(result.spreadWidth/3).toFixed(2)})`);
+      if (!result.bidAskPass) result.failReasons.push(`Bid-ask $${result.bidAsk} > $0.10`);
+      if (!result.deltaPass) result.failReasons.push(`Delta ~${result.delta} outside 0.15-0.22`);
+      if (!result.creditPass) result.failReasons.push(`Credit $${result.credit} < min $${(result.spreadWidth / 3).toFixed(2)}`);
     } else {
-      result.failReasons.push('No suitable strike found');
+      result.failReasons.push('No suitable strike found in options chain');
     }
 
-    // Final verdict
-    if (result.failReasons.length === 0) {
-      result.verdict = result.ivrPass === null ? 'CHECK IVR' : 'PASS';
-    } else if (result.failReasons.every(r => r.includes('IVR') || r.includes('IV'))) {
+    const nonIvrFails = result.failReasons.filter(r => !r.includes('IV'));
+    if (nonIvrFails.length === 0 && result.failReasons.length === 0) {
+      result.verdict = 'PASS';
+    } else if (nonIvrFails.length === 0 && result.failReasons.length > 0) {
       result.verdict = 'CHECK IVR';
     } else {
       result.verdict = 'FAIL';
